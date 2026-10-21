@@ -5,6 +5,7 @@
 #include <list.h>
 #include <stdint.h>
 #include "threads/interrupt.h"
+#include "threads/synch.h"
 #ifdef VM
 #include "vm/vm.h"
 #endif
@@ -108,6 +109,20 @@ struct thread {
 	int recent_cpu;						// recent_cpu 정의 (각 프로세스가 최근에 cpu 시간을 얼마나 사용했는지)
 	struct list_elem allelem;			// all_list에 넣기 위함
 
+	/* process_wait용 (#113) */
+	struct list child_record_list;		// 내가 만든 자식들의 기록(struct record) 목록. 안에 든 건 thread가 아니라 기록이에요
+	struct thread *parents;				// 나를 만든 부모. 부모가 먼저 끝나면 NULL(고아 표시)이 돼요
+	bool exit_called;					// SYS_EXIT로 끝났으면 true. false면 예외로 죽은 거라 종료 코드를 -1로 봐요
+	int exit_status;					// exit()에 넘긴 종료 코드
+
+	struct fd_table *fdt;
+	struct file *running_file;			// 지금 실행 중인 프로그램 파일 (rox, #115). 쓰기 금지를 건 바로 그 struct file이라야 풀 수 있어서 들고 있어요
+
+	/* fork용 (#111). 둘 다 부모 쪽 칸이에요 */
+	struct semaphore fork_sema;			// 부모가 fork 안에서 자식의 복제가 끝날 때까지 잠드는 세마포어. 자식이 up해서 깨워요
+	tid_t fork_result;					// 자식이 적어 주는 fork 결과. 성공이면 자식 tid, 실패면 TID_ERROR
+
+
 #ifdef USERPROG
 	/* Owned by userprog/process.c. */
 	uint64_t *pml4;                     /* Page map level 4 */
@@ -121,6 +136,17 @@ struct thread {
 	/* Owned by thread.c. */
 	struct intr_frame tf;               /* Information for switching */
 	unsigned magic;                     /* Detects stack overflow. */
+};
+
+struct fd_table {
+	struct list fd_list; //해당 프로세스가 열어둔 파일들의 목록
+	int next_fd_index; //다음에 할당받을 fd index
+};
+
+struct file_fd_mapping{
+	int index; //파일에 할당된 fd 번호
+	struct file *mapping_file; //매핑된 실제 파일 포인터 
+	struct list_elem file_fd_elem; //fd_list에 연결하기 위한 고리
 };
 
 /* If false (default), use round-robin scheduler.
@@ -168,5 +194,11 @@ void mlfqs_recalculate_all_priority (void);
 void mlfqs_recalculate_all_recent_cpu (void);
 
 void do_iret (struct intr_frame *tf);
+/* 자식 기록 리스트와 parent 포인터를 지키는 전역 락이에요. 본체는 thread.c에 하나만 있어요.
+   리스트에 넣고 빼는 곳, 자식이 부모 리스트를 도는 곳은 모두 이 락 안에서 해요. */
+extern struct lock process_lock;
+
+/* fd 테이블 초기화. 본체는 thread.c에 있고 process.c에서도 불러서 여기에 선언해 둬요 (#146) */
+void fd_table_init(struct fd_table *t);
 
 #endif /* threads/thread.h */

@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "threads/malloc.h"
 #include "threads/flags.h"
 #include "threads/interrupt.h"
 #include "threads/intr-stubs.h"
@@ -13,6 +14,7 @@
 #include "threads/vaddr.h"
 #include "intrinsic.h"
 #include "fixed_point.h"
+#include "userprog/syscall.h"
 
 #ifdef USERPROG
 #include "userprog/process.h"
@@ -46,6 +48,8 @@ static struct lock tid_lock;
 /* Thread destruction requests */
 static struct list destruction_req;
 
+struct lock sys_lock;  
+
 /* Statistics. */
 static long long idle_ticks;    /* # of timer ticks spent idle. */
 static long long kernel_ticks;  /* # of timer ticks in kernel threads. */
@@ -74,6 +78,11 @@ bool priority_sort(const struct list_elem *,const struct list_elem *, void *aux 
 void thread_preemption(void);
 
 void priority_thread_yield(void);
+
+/* wait용 전역 락이에요.
+ * 부모와 자식이 같이 만지는 것들(child_record_list, parents, 기록 안의 값)을 지켜요.
+ * thread.h에서 extern으로 선언해서 process.c에서도 같이 써요. */
+struct lock process_lock;
 
 int load_avg;
 
@@ -121,6 +130,8 @@ thread_init (void) {
 
 	/* Init the globla thread context */
 	lock_init (&tid_lock);
+	lock_init (&process_lock);	// thread_create가 이 락을 잡으니까, 첫 thread_create(idle) 전에 준비돼 있어야 해요
+	lock_init (&sys_lock);
 	list_init (&ready_list);
 	list_init (&destruction_req);
 	list_init (&all_list);	// all_list 초기화
@@ -130,6 +141,7 @@ thread_init (void) {
 	init_thread (initial_thread, "main", PRI_DEFAULT);
 	initial_thread->status = THREAD_RUNNING;
 	initial_thread->tid = allocate_tid ();
+	
 }
 
 /* Starts preemptive thread scheduling by enabling interrupts.
@@ -199,6 +211,7 @@ tid_t
 thread_create (const char *name, int priority,
 		thread_func *function, void *aux) {
 	struct thread *t;
+	struct record *r;
 	tid_t tid;
 
 	ASSERT (function != NULL);
@@ -207,10 +220,23 @@ thread_create (const char *name, int priority,
 	t = palloc_get_page (PAL_ZERO);
 	if (t == NULL)
 		return TID_ERROR;
+	/* 자식 기록(struct record)을 init_thread보다 먼저 만들어요.
+	 * 실패하면 아직 아무 데도 안 걸린 페이지만 돌려주고 끝내면 돼요. */
+	r = malloc(sizeof(struct record));
+	if (r == NULL)
+	{
+		palloc_free_page(t);
+		return TID_ERROR;
+	}
 
 	/* Initialize thread. */
 	init_thread (t, name, priority);
 	tid = t->tid = allocate_tid ();
+	/* tid가 정해진 다음에 기록을 채워요.
+	 * 세마포어는 0에서 시작해요. 자식이 끝나면서 up하기 전까지 부모의 down이 기다리게 돼요. */
+	r->tid = tid;
+	r->child_address = t;
+	sema_init(&r->process_sema,0);
 
 	/* Call the kernel_thread if it scheduled.
 	 * Note) rdi is 1st argument, and rsi is 2nd argument. */
@@ -222,6 +248,15 @@ thread_create (const char *name, int priority,
 	t->tf.ss = SEL_KDSEG;
 	t->tf.cs = SEL_KCSEG;
 	t->tf.eflags = FLAG_IF;
+
+	/* 부모를 정하고, 기록을 지금 스레드(부모)의 리스트에 매달아요.
+	 * 둘 다 thread_unblock보다 먼저 해야 해요.
+	 * 자식이 먼저 돌기 시작해서 바로 끝나 버려도, 부모 리스트에 자기 기록이 있어야 하니까요. */
+	t->parents = thread_current();
+
+	lock_acquire(&process_lock);
+	list_push_back(&thread_current()->child_record_list, &r->child_elem);
+	lock_release(&process_lock);
 
 	/* Add to run queue. */
 	thread_unblock (t);
@@ -278,11 +313,14 @@ struct thread *
 thread_current (void) {
 	struct thread *t = running_thread ();
 
-	/* Make sure T is really a thread.
-	   If either of these assertions fire, then your thread may
-	   have overflowed its stack.  Each thread has less than 4 kB
-	   of stack, so a few big automatic arrays or moderate
-	   recursion can cause stack overflow. */
+	/* T가 실제로 유효한 스레드인지 확인합니다.
+   이 두 ASSERT 중 하나라도 실패한다면, 해당 스레드에서
+   스택 오버플로가 발생했을 가능성이 있습니다.
+
+   각 스레드는 4KB 미만의 스택 공간을 가지므로,
+   크기가 큰 지역 배열을 몇 개 선언하거나
+   재귀 호출을 어느 정도 반복하는 것만으로도
+   스택 오버플로가 발생할 수 있습니다. */
 	ASSERT (is_thread (t));
 	ASSERT (t->status == THREAD_RUNNING);
 
@@ -298,7 +336,7 @@ thread_tid (void) {
 /* Deschedules the current thread and destroys it.  Never
    returns to the caller. */
 void
-thread_exit (void) {
+thread_exit () {
 	ASSERT (!intr_context ());
 
 #ifdef USERPROG
@@ -589,6 +627,12 @@ init_thread (struct thread *t, const char *name, int priority) {
 	t->my_priority = priority;           // 원래 우선순위 백업 
     t->lock_to_stop = NULL;              // 대기 중인 락 
     list_init (&t->donation_list);       // 기부자 리스트 초기화
+	list_init (&t->child_record_list);	// 내가 만든 자식들의 기록 리스트
+
+	// t->fdt=malloc(sizeof(struct fd_table));
+	// if (t->fdt != NULL) {
+    // 	fd_table_init(t->fdt); //fd_table 구조체 초기화
+	// } 			 
 	
 	if (thread_mlfqs == true) {
         if (t == initial_thread) {
@@ -603,6 +647,14 @@ init_thread (struct thread *t, const char *name, int priority) {
 	}
 	list_push_back(&all_list, &t->allelem);
 
+}
+
+/* 새 프로세스의 fd 테이블을 비운 상태로 준비해요. 0, 1번은 표준 입출력 자리라서 새 fd는 2번부터 줘요.
+   반환형이 없던 걸 void로 고쳤어요 (#146). 없으면 gcc 11은 int로 보고 경고만 내지만, gcc 14부터는 에러예요. */
+void
+fd_table_init(struct fd_table *t){
+	list_init(&t->fd_list);
+	t->next_fd_index=2;
 }
 
 /* Chooses and returns the next thread to be scheduled.  Should
